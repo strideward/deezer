@@ -2753,6 +2753,7 @@ img,svg,video,canvas{max-width:100%;height:auto}
         <div class="chips" role="group" aria-label="Library filters">
           <button class="chip is-on" type="button">All</button>
           <button class="chip" type="button">Downloads</button>
+          <button class="chip" type="button">Offline</button>
           <button class="chip" type="button">Liked</button>
           <button class="chip" type="button">Playlists</button>
           <button class="chip" type="button">Purchases</button>
@@ -2765,6 +2766,15 @@ img,svg,video,canvas{max-width:100%;height:auto}
           </div>
           <div class="cards" id="library-downloads">
             <div class="notification-empty">No downloads yet.</div>
+          </div>
+        </section>
+
+        <section class="rail" data-library="offline">
+          <div class="rail-head">
+            <h2>Available offline</h2>
+          </div>
+          <div class="cards" id="library-offline">
+            <div class="notification-empty">No tracks saved for offline listening yet.</div>
           </div>
         </section>
 
@@ -4617,6 +4627,15 @@ img,svg,video,canvas{max-width:100%;height:auto}
   </div>
 </div>
 
+<script>
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('/service-worker.js').catch(function (error) {
+      console.warn('Offline support could not be enabled.', error);
+    });
+  });
+}
+</script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function () {
@@ -7714,9 +7733,11 @@ img,svg,video,canvas{max-width:100%;height:auto}
 
   function renderLibrary() {
     var downloaded = PROJECT_POOL.filter(function (p) { return DOWNLOADS[p.id]; });
+    var offline = loadOfflineProjects();
     var liked = PROJECT_POOL.filter(function (p) { return LIKES[p.id]; });
 
     fillLibrarySection('library-downloads', 'Downloads', downloaded, 'No downloads yet.');
+    fillLibrarySection('library-offline', 'Available offline', offline, 'No tracks saved for offline listening yet.');
     fillLibrarySection('library-liked', 'Liked', liked, 'Nothing liked yet.');
 
     var playlists = document.getElementById('library-playlists');
@@ -7726,6 +7747,7 @@ img,svg,video,canvas{max-width:100%;height:auto}
       var key = section.getAttribute('data-library');
       var show = libraryFilter === 'All' ||
         (libraryFilter === 'Downloads' && key === 'downloads') ||
+        (libraryFilter === 'Offline' && key === 'offline') ||
         (libraryFilter === 'Liked' && key === 'liked') ||
         (libraryFilter === 'Playlists' && key === 'playlists') ||
         (libraryFilter === 'Purchases' && key === 'purchases');
@@ -8305,8 +8327,79 @@ img,svg,video,canvas{max-width:100%;height:auto}
     var AUDIO_CACHE_NAME = 'parallery-audio-v1';
     var AUDIO_CACHE_TRACK_LIMIT = 20 * 1024 * 1024;
     var AUDIO_CACHE_TOTAL_LIMIT = 100 * 1024 * 1024;
+    var OFFLINE_PROJECTS_KEY = 'parrallery.offlineProjects.v1';
+
+    function loadOfflineProjects() {
+      try {
+        var stored = JSON.parse(localStorage.getItem(OFFLINE_PROJECTS_KEY) || '[]');
+        return Array.isArray(stored) ? stored.filter(function (project) {
+          return project && project.id && project.title && project.fileUrl;
+        }) : [];
+      } catch (error) {
+        console.warn('Offline track details could not be loaded', error);
+        return [];
+      }
+    }
+
+    function saveOfflineProject(p) {
+      var project = {
+        id: p.id,
+        userId: p.userId || '',
+        title: p.title || 'Untitled',
+        creator: creatorNameFor(p) || p.creator || 'Creator',
+        role: p.role || 'Creator',
+        type: p.type || 'Project',
+        releaseType: p.releaseType || '',
+        featuredArtistNames: featuredArtistNamesFor(p),
+        description: p.description || '',
+        tags: Array.isArray(p.tags) ? p.tags : [],
+        cover: p.cover || '',
+        fileName: p.fileName || '',
+        fileUrl: p.fileUrl,
+        views: String(p.views || '0'),
+        likes: String(p.likes || '0'),
+        shares: String(p.shares || '0'),
+        downloads: String(p.downloads || '0'),
+        plays: String(p.plays || '0'),
+        date: p.date || '',
+        createdAt: p.createdAt || '',
+        state: p.state || 'active',
+        frozenUntil: p.frozenUntil || ''
+      };
+      try {
+        var projects = loadOfflineProjects().filter(function (cached) {
+          return String(cached.id) !== String(project.id);
+        });
+        projects.unshift(project);
+        localStorage.setItem(OFFLINE_PROJECTS_KEY, JSON.stringify(projects.slice(0, 20)));
+        renderLibrary();
+      } catch (error) {
+        console.warn('Offline track details could not be saved', error);
+      }
+    }
+
+    function forgetOfflineProject(fileUrl) {
+      try {
+        var projects = loadOfflineProjects().filter(function (project) {
+          return project.fileUrl !== fileUrl;
+        });
+        localStorage.setItem(OFFLINE_PROJECTS_KEY, JSON.stringify(projects));
+        renderLibrary();
+      } catch (error) {
+        console.warn('Offline track details could not be updated', error);
+      }
+    }
 
     function audioCacheRequest(p) {
+      if (!p || !p.fileUrl || !window.caches || !window.isSecureContext) return null;
+      try {
+        return new Request(new URL(String(p.fileUrl), location.href).href);
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function legacyAudioCacheRequest(p) {
       if (!p || !p.id || !p.fileUrl || !window.caches || !window.isSecureContext) return null;
       var value = String(p.fileUrl);
       var hash = 2166136261;
@@ -8322,7 +8415,10 @@ img,svg,video,canvas{max-width:100%;height:auto}
       var request = audioCacheRequest(p);
       if (!request) return Promise.resolve(null);
       return caches.open(AUDIO_CACHE_NAME).then(function (cache) {
-        return cache.match(request);
+        return cache.match(request).then(function (response) {
+          var legacyRequest = legacyAudioCacheRequest(p);
+          return response || (legacyRequest ? cache.match(legacyRequest) : null);
+        });
       }).then(function (response) {
         if (!response) return null;
         return response.blob().then(function (blob) {
@@ -8336,42 +8432,59 @@ img,svg,video,canvas{max-width:100%;height:auto}
 
     function cacheAudioInBackground(p) {
       var request = audioCacheRequest(p);
-      if (!request || audioCacheWrites[p.id]) return;
+      if (!p || !p.id || !request || audioCacheWrites[p.id]) return;
       audioCacheWrites[p.id] = true;
       caches.open(AUDIO_CACHE_NAME).then(function (cache) {
         return cache.match(request).then(function (existing) {
-          if (existing) return null;
-          return fetch(p.fileUrl).then(function (response) {
-            if (!response.ok || response.status !== 200 || response.type === 'opaque') return null;
-            var size = Number(response.headers.get('content-length'));
-            if (!isFinite(size) || size <= 0 || size > AUDIO_CACHE_TRACK_LIMIT) return null;
-            return cache.keys().then(function (keys) {
-              return Promise.all(keys.map(function (key) {
-                return cache.match(key).then(function (item) {
-                  return {
-                    key: key,
-                    size: Number(item && item.headers.get('content-length')) || 0,
-                    cachedAt: Number(item && item.headers.get('x-parallery-cached-at')) || 0
-                  };
-                });
-              }));
-            }).then(function (entries) {
-              entries.sort(function (a, b) { return a.cachedAt - b.cachedAt; });
-              var total = entries.reduce(function (sum, entry) { return sum + entry.size; }, 0);
-              var evictions = [];
-              while (entries.length && total + size > AUDIO_CACHE_TOTAL_LIMIT) {
-                var oldest = entries.shift();
-                total -= oldest.size;
-                evictions.push(cache.delete(oldest.key));
-              }
-              return Promise.all(evictions).then(function () {
-                var headers = new Headers(response.headers);
-                headers.set('x-parallery-cached-at', String(Date.now()));
-                return cache.put(request, new Response(response.body, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: headers
+          if (existing) {
+            saveOfflineProject(p);
+            return null;
+          }
+          var legacyRequest = legacyAudioCacheRequest(p);
+          return (legacyRequest ? cache.match(legacyRequest) : Promise.resolve(null)).then(function (legacy) {
+            if (legacy) {
+              return cache.put(request, legacy.clone()).then(function () {
+                return cache.delete(legacyRequest);
+              }).then(function () {
+                saveOfflineProject(p);
+              });
+            }
+            return fetch(p.fileUrl).then(function (response) {
+              if (!response.ok || response.status !== 200 || response.type === 'opaque') return null;
+              var size = Number(response.headers.get('content-length'));
+              if (!isFinite(size) || size <= 0 || size > AUDIO_CACHE_TRACK_LIMIT) return null;
+              return cache.keys().then(function (keys) {
+                return Promise.all(keys.map(function (key) {
+                  return cache.match(key).then(function (item) {
+                    return {
+                      key: key,
+                      size: Number(item && item.headers.get('content-length')) || 0,
+                      cachedAt: Number(item && item.headers.get('x-parallery-cached-at')) || 0
+                    };
+                  });
                 }));
+              }).then(function (entries) {
+                entries.sort(function (a, b) { return a.cachedAt - b.cachedAt; });
+                var total = entries.reduce(function (sum, entry) { return sum + entry.size; }, 0);
+                var evictions = [];
+                while (entries.length && total + size > AUDIO_CACHE_TOTAL_LIMIT) {
+                  var oldest = entries.shift();
+                  total -= oldest.size;
+                  evictions.push((function (key, url) {
+                    return cache.delete(key).then(function () {
+                      forgetOfflineProject(url);
+                    });
+                  })(oldest.key, oldest.key.url));
+                }
+                return Promise.all(evictions).then(function () {
+                  var headers = new Headers(response.headers);
+                  headers.set('x-parallery-cached-at', String(Date.now()));
+                  return cache.put(request, new Response(response.body, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: headers
+                  })).then(function () { saveOfflineProject(p); });
+                });
               });
             });
           });
@@ -9075,6 +9188,11 @@ img,svg,video,canvas{max-width:100%;height:auto}
         }
         if (!cachedSource) return;
         var wasPlaying = !playerAudio.paused;
+        var shouldResume = wasPlaying || navigator.onLine === false;
+        if (!shouldResume) {
+          URL.revokeObjectURL(cachedSource);
+          return;
+        }
         var currentTime = playerAudio.currentTime || 0;
         playerAudio.pause();
         playerObjectUrl = cachedSource;
@@ -9083,7 +9201,7 @@ img,svg,video,canvas{max-width:100%;height:auto}
           if (currentTime > 0 && currentTime < playerAudio.duration) {
             playerAudio.currentTime = currentTime;
           }
-          if (wasPlaying) {
+          if (shouldResume) {
             playerAudio.play().catch(function (error) {
               if (!error || error.name !== 'AbortError') {
                 showToast('Could not play cached audio. Check the audio file and try again.');
@@ -9101,7 +9219,7 @@ img,svg,video,canvas{max-width:100%;height:auto}
             if (currentTime > 0 && currentTime < playerAudio.duration) {
               playerAudio.currentTime = currentTime;
             }
-            if (wasPlaying) playerAudio.play().catch(function () {});
+            if (shouldResume) playerAudio.play().catch(function () {});
           }, { once: true });
           playerAudio.src = p.fileUrl;
           playerAudio.load();
@@ -9129,7 +9247,9 @@ img,svg,video,canvas{max-width:100%;height:auto}
         if (err && err.name === 'AbortError') return;
         isPlaying = false;
         updatePlayIcon();
-        showToast('Could not play audio. Check the audio file and try again.');
+        showToast(navigator.onLine === false
+          ? 'This track is not saved for offline listening.'
+          : 'Could not play audio. Check the audio file and try again.');
         console.warn('Audio play failed', err);
       });
     }
@@ -12483,6 +12603,12 @@ img,svg,video,canvas{max-width:100%;height:auto}
     NEW_TITLES = PROJECT_POOL.slice(0, 5).map(function (p) { return p.title; });
   }
 
+  function applyOfflineProjects() {
+    PROJECT_POOL = loadOfflineProjects();
+    TRENDING_TITLES = PROJECT_POOL.slice(0, 5).map(function (p) { return p.title; });
+    NEW_TITLES = PROJECT_POOL.slice(0, 5).map(function (p) { return p.title; });
+  }
+
   function ensureProfile() {
     if (!SESSION || !SESSION.user || ME) return Promise.resolve();
     var user = SESSION.user;
@@ -12646,7 +12772,12 @@ img,svg,video,canvas{max-width:100%;height:auto}
   }
 
   function loadFromSupabase() {
-    if (!db) return Promise.resolve(false);
+    if (!db || navigator.onLine === false) {
+      applyOfflineProjects();
+      renderEverything();
+      finishBoot();
+      return Promise.resolve(false);
+    }
 
     var token = ++LOAD_TOKEN;
 
@@ -12667,6 +12798,8 @@ img,svg,video,canvas{max-width:100%;height:auto}
     return Promise.race([supabaseLoad, timeout]).then(function (results) {
       if (results === 'timeout') {
         console.warn('Supabase load timed out');
+        applyOfflineProjects();
+        renderEverything();
         finishBoot();
         return false;
       }
@@ -12680,7 +12813,8 @@ img,svg,video,canvas{max-width:100%;height:auto}
 
       ME = null;
       applyProfiles(profRes && profRes.data);
-      applyProjects(projRes && projRes.data);
+      if (projRes && projRes.error) applyOfflineProjects();
+      else applyProjects(projRes && projRes.data);
       if (SESSION) repairMissingFileUrls();
 
       return withTimeout(loadPersonalData(token), 10000, token).then(function () {
@@ -12695,6 +12829,8 @@ img,svg,video,canvas{max-width:100%;height:auto}
       });
     }).catch(function (e) {
       console.warn('Supabase load failed:', e && (e.message || e));
+      applyOfflineProjects();
+      renderEverything();
       finishBoot();
       return false;
     });
@@ -13039,6 +13175,7 @@ img,svg,video,canvas{max-width:100%;height:auto}
 
     var alreadyDownloaded = !!DOWNLOADS[p.id];
     var prevDownloads = p.downloads;
+    cacheAudioInBackground(p);
     var opened = triggerDownload(p.fileUrl);
     if (!opened) { showToast('Could not start download'); return; }
     if (!db) {
