@@ -7091,11 +7091,37 @@ img,svg,video,canvas{max-width:100%;height:auto}
     });
   }
 
+  var HOME_GREETING_HIDDEN_DATE_KEY = 'parrallery.homeGreeting.hiddenDate';
   var homeGreetingTimer = null;
+
+  function homeGreetingDateKey() {
+    var now = new Date();
+    return now.getFullYear() + '-' + (now.getMonth() + 1) + '-' + now.getDate();
+  }
+
+  var homeGreetingHiddenToday = false;
+  try {
+    homeGreetingHiddenToday = localStorage.getItem(HOME_GREETING_HIDDEN_DATE_KEY) === homeGreetingDateKey();
+  } catch (error) {
+    console.warn('Unable to restore home greeting visibility.', error);
+  }
+
+  function hideHomeGreetingToday() {
+    if (homeGreetingHiddenToday) return;
+    homeGreetingHiddenToday = true;
+    var greeting = document.getElementById('home-greeting');
+    if (greeting) greeting.hidden = true;
+    try {
+      localStorage.setItem(HOME_GREETING_HIDDEN_DATE_KEY, homeGreetingDateKey());
+    } catch (error) {
+      console.warn('Unable to save home greeting visibility.', error);
+    }
+  }
 
   function renderHomeGreeting() {
     var greeting = document.getElementById('home-greeting');
     if (!greeting) return;
+    greeting.hidden = homeGreetingHiddenToday;
 
     var now = new Date();
     var hour = now.getHours();
@@ -7113,6 +7139,18 @@ img,svg,video,canvas{max-width:100%;height:auto}
       nextChange.setHours(0, 0, 0, 0);
     }
     homeGreetingTimer = setTimeout(renderHomeGreeting, nextChange.getTime() - now.getTime() + 50);
+  }
+
+  var homeGreetingScroll = document.querySelector('#view-home > .home-scroll');
+  if (homeGreetingScroll) {
+    var previousHomeScrollTop = homeGreetingScroll.scrollTop;
+    homeGreetingScroll.addEventListener('scroll', function () {
+      var currentHomeScrollTop = homeGreetingScroll.scrollTop;
+      if (currentHomeScrollTop < previousHomeScrollTop && previousHomeScrollTop > 0) {
+        hideHomeGreetingToday();
+      }
+      previousHomeScrollTop = currentHomeScrollTop;
+    }, { passive: true });
   }
 
   window.addEventListener('focus', renderHomeGreeting);
