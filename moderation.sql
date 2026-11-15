@@ -1,10 +1,10 @@
 -- Parrallery moderation + verification — run in SQL Editor → Run (safe to re-run)
--- Adds: verification tiers, quieter message notifications, deletable messages
+-- Adds: creator verification, quieter message notifications, deletable messages
 -- and notifications, content states (active/frozen/banned), AI report triage,
 -- moderation audit trail and account bans.
 
 -- =========================================================
--- PROFILE: VERIFICATION TIERS + ACCOUNT STATE
+-- PROFILE: CREATOR VERIFICATION + ACCOUNT STATE
 -- =========================================================
 alter table public.profiles add column if not exists verification_tier text;
 alter table public.profiles add column if not exists state text default 'active';
@@ -12,21 +12,46 @@ alter table public.profiles add column if not exists banned_reason text;
 alter table public.profiles add column if not exists banned_until timestamptz;
 alter table public.profiles add column if not exists banned_at timestamptz;
 
+create table if not exists public.creator_verification_attestations (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  original_uploads_confirmed boolean not null,
+  rights_confirmed boolean not null,
+  profile_image_confirmed boolean not null,
+  attested_at timestamptz not null default now(),
+  check (original_uploads_confirmed and rights_confirmed and profile_image_confirmed)
+);
+alter table public.creator_verification_attestations enable row level security;
+drop policy if exists "creator_verification_attestations_select_own" on public.creator_verification_attestations;
+create policy "creator_verification_attestations_select_own"
+  on public.creator_verification_attestations for select to authenticated
+  using (user_id = auth.uid());
+revoke all on public.creator_verification_attestations from public, anon, authenticated;
+grant select on public.creator_verification_attestations to authenticated;
+
 -- keep the legacy verified flag true for every tier
 update public.profiles
    set verification_tier = 'basic'
  where verified = true and verification_tier is null;
 
--- backfill by follower count (trusted wins over basic)
+-- backfill newly eligible artists who have already submitted all declarations
 update public.profiles p
    set verification_tier = 'basic', verified = true
  where p.verification_tier is null
-   and (select count(*) from public.follows f where f.following_id = p.user_id) >= 25;
-
-update public.profiles p
-   set verification_tier = 'trusted', verified = true
- where p.verification_tier = 'basic'
-   and (select count(*) from public.follows f where f.following_id = p.user_id) >= 100;
+   and (select count(*) from public.follows f where f.following_id = p.user_id) >= 25
+   and (select count(*) from public.projects pr where pr.user_id = p.user_id and pr.type = 'Audio') >= 2
+   and nullif(btrim(coalesce(p.name, '')), '') is not null
+   and nullif(btrim(coalesce(p.img, '')), '') is not null
+   and p.img !~* 'api\.dicebear\.com'
+   and not exists (
+     select 1 from public.projects pr
+     where pr.user_id = p.user_id and pr.type = 'Audio'
+       and lower(btrim(coalesce(pr.creator, ''))) <> lower(btrim(p.name))
+   )
+   and exists (
+     select 1 from public.creator_verification_attestations a
+     where a.user_id = p.user_id
+       and a.original_uploads_confirmed and a.rights_confirmed and a.profile_image_confirmed
+   );
 
 -- =========================================================
 -- CONTENT STATE (projects + presets + samples share this table)
@@ -225,7 +250,8 @@ create trigger projects_guard_state
   for each row execute function public.guard_project_state();
 
 -- =========================================================
--- VERIFICATION · 25 followers = basic, 100 = trusted
+-- VERIFIED ARTIST · 25 followers, two audio uploads, profile match,
+-- a non-default profile image, and user attestations
 -- =========================================================
 create or replace function public.check_verification(p_user uuid)
 returns text
@@ -235,25 +261,45 @@ set search_path = public
 as $$
 declare
   tier text;
-  follower_count int;
+  follower_count bigint;
+  song_count bigint;
+  profile_name text;
+  profile_image text;
+  track_names_match boolean;
+  declarations_confirmed boolean;
 begin
   if p_user is null then return null; end if;
 
   perform set_config('parrallery.privileged', 'on', true);
 
-  select verification_tier into tier from public.profiles where user_id = p_user;
+  select verification_tier, name, img
+    into tier, profile_name, profile_image
+    from public.profiles where user_id = p_user;
   select count(*) into follower_count from public.follows where following_id = p_user;
+  select count(*) into song_count
+    from public.projects pr
+   where pr.user_id = p_user and pr.type = 'Audio';
+  select not exists (
+    select 1 from public.projects pr
+    where pr.user_id = p_user and pr.type = 'Audio'
+      and lower(btrim(coalesce(pr.creator, ''))) <> lower(btrim(coalesce(profile_name, '')))
+  ) into track_names_match;
+  select exists (
+    select 1 from public.creator_verification_attestations a
+    where a.user_id = p_user
+      and a.original_uploads_confirmed
+      and a.rights_confirmed
+      and a.profile_image_confirmed
+  ) into declarations_confirmed;
 
-  if follower_count >= 100 and coalesce(tier, '') <> 'trusted' then
-    update public.profiles
-       set verification_tier = 'trusted', verified = true
-     where user_id = p_user;
-    insert into public.notifications (user_id, actor_id, kind, body)
-    values (p_user, null, 'verified', 'You are now Trusted Verified!');
-    return 'trusted';
-  end if;
-
-  if follower_count >= 25 and tier is null then
+  if follower_count >= 25
+     and song_count >= 2
+     and nullif(btrim(coalesce(profile_name, '')), '') is not null
+     and nullif(btrim(coalesce(profile_image, '')), '') is not null
+     and profile_image !~* 'api\.dicebear\.com'
+     and track_names_match
+     and declarations_confirmed
+     and tier is null then
     update public.profiles
        set verification_tier = 'basic', verified = true
      where user_id = p_user;
@@ -266,6 +312,47 @@ $$;
 
 revoke all on function public.check_verification(uuid) from public;
 revoke all on function public.check_verification(uuid) from anon, authenticated;
+
+create or replace function public.attest_creator_verification(
+  p_original_uploads_confirmed boolean,
+  p_rights_confirmed boolean,
+  p_profile_image_confirmed boolean
+)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  is_verified boolean;
+begin
+  if uid is null then
+    raise exception 'Sign in is required to submit creator verification declarations';
+  end if;
+  if p_original_uploads_confirmed is not true
+     or p_rights_confirmed is not true
+     or p_profile_image_confirmed is not true then
+    raise exception 'All creator verification declarations must be confirmed';
+  end if;
+
+  insert into public.creator_verification_attestations (
+    user_id, original_uploads_confirmed, rights_confirmed, profile_image_confirmed, attested_at
+  ) values (uid, true, true, true, now())
+  on conflict (user_id) do update
+    set original_uploads_confirmed = excluded.original_uploads_confirmed,
+        rights_confirmed = excluded.rights_confirmed,
+        profile_image_confirmed = excluded.profile_image_confirmed,
+        attested_at = excluded.attested_at;
+
+  perform public.check_verification(uid);
+  select verified into is_verified from public.profiles where user_id = uid;
+  return case when is_verified then 'approved' else 'pending' end;
+end;
+$$;
+
+revoke all on function public.attest_creator_verification(boolean, boolean, boolean) from public, anon;
+grant execute on function public.attest_creator_verification(boolean, boolean, boolean) to authenticated;
 
 create or replace function public.verify_on_follow()
 returns trigger
@@ -283,6 +370,46 @@ drop trigger if exists follows_verify on public.follows;
 create trigger follows_verify
   after insert on public.follows
   for each row execute function public.verify_on_follow();
+
+create or replace function public.verify_on_project_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform public.check_verification(new.user_id);
+  return new;
+end;
+$$;
+
+drop trigger if exists projects_verify on public.projects;
+drop trigger if exists projects_verify_insert on public.projects;
+create trigger projects_verify_insert
+  after insert on public.projects
+  for each row execute function public.verify_on_project_change();
+
+drop trigger if exists projects_verify_update on public.projects;
+create trigger projects_verify_update
+  after update of type, user_id, creator on public.projects
+  for each row execute function public.verify_on_project_change();
+
+create or replace function public.verify_on_profile_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform public.check_verification(new.user_id);
+  return new;
+end;
+$$;
+
+drop trigger if exists profiles_verify on public.profiles;
+create trigger profiles_verify
+  after update of name, img on public.profiles
+  for each row execute function public.verify_on_profile_change();
 
 -- =========================================================
 -- MESSAGE NOTIFICATIONS · one unread row per conversation,
